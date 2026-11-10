@@ -366,8 +366,10 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     api.play(curId, curEp)
       .then((info) => {
         if (!alive) return;
-        if (!info?.video_url) throw new Error("暂无播放地址");
-        setPlayUrls((m) => ({ ...m, [playKey]: info.video_url }));
+        // 新播放接口 /episodes/{ep}/playback 返回 streams.main；video_url 是旧字段，作兜底。
+        const streamUrl = info?.streams?.main || info?.video_url;
+        if (!streamUrl) throw new Error("暂无播放地址");
+        setPlayUrls((m) => ({ ...m, [playKey]: streamUrl }));
         addHistory(curId, curEp);
       })
       .catch((e) => { if (alive) setErr((e as Error).message || "取播放地址失败"); });
