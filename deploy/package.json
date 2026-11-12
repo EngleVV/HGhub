@@ -1,0 +1,7 @@
+{
+  "name": "hghub-deploy",
+  "private": true,
+  "version": "1.0.0",
+  "type": "commonjs",
+  "description": "HGhub 网页版服务端代理（Node 16 纯内置模块，无第三方依赖）"
+}

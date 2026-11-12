@@ -31,3 +31,6 @@ docs/API.md
 
 # Agent instructions (local)
 AGENTS.md
+
+# WorkBuddy 项目数据（含本地记忆日志，含服务器/账号信息，不要提交）
+.workbuddy/

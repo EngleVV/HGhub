@@ -17,16 +17,25 @@ export const isIos =
 export const isAndroid = /Android/i.test(ua);
 export const isMacos = !isIos && /Macintosh|Mac OS X/i.test(ua);
 export const isLinux = !isAndroid && !isIos && /Linux/i.test(ua);
+/** 是否运行在 Tauri 壳内（有 `__TAURI_INTERNALS__` 才有 `invoke`）。
+ *  网页版没有这个全局对象，走同源 `fetch('/api/edge')` 服务端代理。 */
+export const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+/** 网页版（非 Tauri）统一按移动端布局渲染：没有桌面窗口壳（标题栏 / 无边框缩放热区）可依赖。 */
 export const platform: "android" | "ios" | "windows" | "macos" | "linux" =
-  isAndroid ? "android" : isIos ? "ios" : isMacos ? "macos" : isLinux ? "linux" : "windows";
-/** 移动端（安卓 / iOS）共用触屏界面 */
-export const isMobile = isAndroid || isIos;
+  isTauri
+    ? (isAndroid ? "android" : isIos ? "ios" : isMacos ? "macos" : isLinux ? "linux" : "windows")
+    : "ios";
+/** 移动端（安卓 / iOS）共用触屏界面；网页版同样走移动端布局 */
+export const isMobile = isAndroid || isIos || !isTauri;
 
 /** 自定义协议地址随平台不同（见 tauri `register_asynchronous_uri_scheme_protocol` 文档）：
  *  Windows / Android → `http://<scheme>.localhost`
  *  macOS / iOS / Linux → `<scheme>://localhost`
- *  Rust 侧 `src-tauri/src/lib.rs` 里改写 m3u8 用的 scheme 必须与此一致。 */
-export const LOCAL = isMacos || isIos || isLinux ? "hg://localhost" : "http://hg.localhost";
+ *  Rust 侧 `src-tauri/src/lib.rs` 里改写 m3u8 用的 scheme 必须与此一致。
+ *  网页版（非 Tauri）走同源相对路径：`/hls`、`/seg`、`/img` 由服务端代理。 */
+export const LOCAL = isTauri
+  ? (isMacos || isIos || isLinux ? "hg://localhost" : "http://hg.localhost")
+  : "";
 
 /** src 是否已是本地协议地址（避免在详情页把代理地址再包一层） */
 export const isLocalMedia = (src: string) => src.startsWith(`${LOCAL}/`);
@@ -40,10 +49,12 @@ export const playlist = (url: string) => `${LOCAL}/hls?u=${encodeURIComponent(ur
 
 /* ── 调用封装 ───────────────────────────────────────────── */
 
-/** 写一行到应用数据目录 debug.log（用户反馈「打不开」时要的就是它） */
-export const logLine = (msg: string) => invoke("debug_log", { msg }).catch(() => {});
+/** 写一行到应用数据目录 debug.log（用户反馈「打不开」时要的就是它）。网页版无本地日志，直接忽略。 */
+export const logLine = (msg: string) =>
+  isTauri ? invoke("debug_log", { msg }).catch(() => {}) : Promise.resolve();
 
 async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  if (!isTauri) return webInvoke<T>(cmd, args);
   try {
     return (await invoke(cmd, args)) as T;
   } catch (e) {
@@ -55,6 +66,152 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
       throw new Error(`服务器请求失败（HTTP ${status}），请稍后重试或在设置中切换线路`);
     }
     throw new Error(msg.length > 140 ? `${msg.slice(0, 140)}…` : msg);
+  }
+}
+
+/* ── 网页版：服务端代理 + 会话 ───────────────────────────── */
+
+/** 网页版会话存 localStorage；token 只存在浏览器侧，随请求透传给服务端。 */
+const WEB_SESSION = "hghub_web_session";
+
+function webToken(): string {
+  try {
+    const raw = localStorage.getItem(WEB_SESSION);
+    return raw ? ((JSON.parse(raw) as { token?: string }).token ?? "") : "";
+  } catch { return ""; }
+}
+
+function webUser(): User | null {
+  try {
+    const raw = localStorage.getItem(WEB_SESSION);
+    if (!raw) return null;
+    return (JSON.parse(raw) as { user?: User }).user ?? null;
+  } catch { return null; }
+}
+
+function webSetSession(token: string, user: unknown) {
+  try { localStorage.setItem(WEB_SESSION, JSON.stringify({ token, user })); } catch { /* ignore */ }
+}
+
+function webClearSession() {
+  try { localStorage.removeItem(WEB_SESSION); } catch { /* ignore */ }
+}
+
+/** 走同源服务端代理 `POST /api/edge`，返回业务 data（与 Tauri `edge()` 解包后一致）。 */
+async function webFetch<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const res = await fetch("/api/edge", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ method, path, body: body ?? null, token: webToken() }),
+  });
+  let data: unknown = null;
+  try { data = await res.json(); } catch { /* 非 JSON 响应 */ }
+  const err = (data && typeof data === "object" && "error" in data)
+    ? (data as { error?: string }).error
+    : undefined;
+  if (!res.ok || err) {
+    throw new Error(err || `服务器请求失败（HTTP ${res.status}），请稍后重试`);
+  }
+  return data as T;
+}
+
+/** 浏览器端的 `invoke` 替身：把命令映射到上游接口，或降级为本地实现。 */
+async function webInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const a = args ?? {};
+  switch (cmd) {
+    /* 本地命令降级 */
+    case "app_boot":
+      return { user: webUser(), logged_in: !!webToken(), base: "", strict_security: true, cli_relaxed: false } as T;
+    case "security_set":
+      return true as T;
+    case "cache_clear":
+      return undefined as T;
+    case "net_diag":
+      return { web: true, base: "" } as T;
+    case "line_state":
+      return { base: "", default: "https://huangguoai.com", fixed: [] } as T;
+    case "line_set":
+      return "" as T;
+    case "line_mirrors":
+      return { source: "", items: [] } as T;
+    case "line_probe":
+      return [] as T;
+    case "check_update":
+      return { current: APP_VERSION, latest: APP_VERSION, has_update: false, url: "" } as T;
+    case "open_url": {
+      const u = String(a.url ?? "");
+      if (/^https?:\/\//i.test(u)) window.open(u, "_blank", "noopener,noreferrer");
+      return undefined as T;
+    }
+
+    /* 账号 */
+    case "api_login": {
+      const data = await webFetch<{ token: string; user: User }>("POST", "/api/account/loginByPassword", {
+        username: a.username, password: a.password,
+      });
+      webSetSession(data.token, data.user);
+      return { user: data.user } as T;
+    }
+    case "api_register": {
+      const body: Record<string, unknown> = {
+        username: a.username, password: a.password, confirm_password: a.password,
+      };
+      if (typeof a.email === "string" && a.email.trim()) body.email = a.email;
+      const data = await webFetch<{ token: string; user: User }>("POST", "/api/account/registerByPassword", body);
+      webSetSession(data.token, data.user);
+      return { user: data.user } as T;
+    }
+    case "api_logout": {
+      try { await webFetch("POST", "/api/account/logout"); } catch { /* ignore */ }
+      webClearSession();
+      return { ok: true } as T;
+    }
+    case "api_me":
+      return webFetch<T>("GET", "/api/account/me");
+
+    /* 列表 / 详情 / 播放 */
+    case "api_feed":
+      return webFetch<T>("GET", `/api/videos?page=${a.page}&size=${a.size}`);
+    case "api_category":
+      return webFetch<T>("GET", `/api/videos/category/${a.cate}?page=${a.page}&size=${a.size}`);
+    case "api_rank":
+      return webFetch<T>("GET", `/api/ranks/${a.kind}`);
+    case "api_search":
+      return webFetch<T>("GET", `/api/search?q=${encodeURIComponent(String(a.q))}&page=${a.page}&size=${a.size}`);
+    case "api_posts":
+      return webFetch<T>("GET", `/api/posts?page=${a.page}&size=${a.size}`);
+    case "api_post":
+      return webFetch<T>("GET", `/api/posts/${a.id}`);
+    case "api_video":
+      return webFetch<T>("GET", `/api/videos/${a.id}`);
+    case "api_play":
+      return webFetch<T>("POST", `/api/videos/${a.id}/episodes/${a.ep}/playback`, {});
+
+    /* 评论 / 互动 */
+    case "api_comments":
+      return webFetch<T>("GET", `/api/videos/${a.id}/comments?ep=${a.ep}&page=${a.page}&size=${a.size}`);
+    case "api_comment_send": {
+      const rid = (a.replyId as number) ?? 0;
+      const body: Record<string, unknown> = { text: a.text };
+      const path = rid > 0 ? `/api/videos/${a.id}/comments` : `/api/videos/${a.id}/comments?ep=${a.ep}`;
+      if (rid > 0) body.reply_id = rid;
+      return webFetch<T>("POST", path, body);
+    }
+    case "api_like":
+      return webFetch<T>(a.on ? "POST" : "DELETE", `/api/videos/${a.id}/like?ep=${a.ep}`);
+    case "api_collect":
+      return webFetch<T>(a.on ? "POST" : "DELETE", `/api/videos/${a.id}/collect`);
+    case "api_follow":
+      return webFetch<T>(a.on ? "POST" : "DELETE", `/api/users/${a.uid}/follow`);
+    case "api_post_like":
+      return webFetch<T>(a.on ? "POST" : "DELETE", `/api/posts/${a.id}/like`);
+    case "api_post_collect":
+      return webFetch<T>(a.on ? "POST" : "DELETE", `/api/posts/${a.id}/collect`);
+    case "api_post_comments":
+      return webFetch<T>("GET", `/api/posts/${a.id}/comments?page=${a.page}&size=${a.size}`);
+
+    default:
+      throw new Error("网页版不支持此操作");
   }
 }
 
@@ -97,10 +254,10 @@ export const api = {
   commentSend: (id: number, ep: number, text: string, replyId?: number) =>
     call<unknown>("api_comment_send", { id, ep, text, replyId: replyId ?? null }),
 
-  clearCache: () => invoke<void>("cache_clear"),
-  netDiag: () => invoke<Record<string, unknown>>("net_diag"),
-  postLike: (id: number, on: boolean) => invoke<unknown>("api_post_like", { id, on }),
-  postCollect: (id: number, on: boolean) => invoke<unknown>("api_post_collect", { id, on }),
+  clearCache: () => call<void>("cache_clear"),
+  netDiag: () => call<Record<string, unknown>>("net_diag"),
+  postLike: (id: number, on: boolean) => call<unknown>("api_post_like", { id, on }),
+  postCollect: (id: number, on: boolean) => call<unknown>("api_post_collect", { id, on }),
   postComments: (id: number, page: number, size: number) => call<CommentPage>("api_post_comments", { id, page, size }),
   like: (id: number, ep: number, on: boolean) => call<unknown>("api_like", { id, ep, on }),
   collect: (id: number, on: boolean) => call<unknown>("api_collect", { id, on }),
